@@ -6,4 +6,5 @@ version.workspace = true
 
 [dependencies]
 alloy.workspace = true
+tokio.workspace = true
 thiserror.workspace = true

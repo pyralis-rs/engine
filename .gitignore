@@ -1,0 +1,8 @@
+target/
+.env
+config/local.toml
+Codex.md
+STAGE_COMMANDS.md
+docs/
+*.md
+!README.md

@@ -1,0 +1,29 @@
+[network]
+chain_id = 8453
+chain_name = "base"
+rpc_ws_endpoints = [
+    "wss://mainnet.base.org",
+]
+rpc_http_endpoints = [
+    "https://mainnet.base.org",
+]
+pool_manager_address = "0x0000000000000000000000000000000000000000"
+block_time_ms = 2000
+
+[simulation]
+cache_size = 2048
+max_gas_limit = 30000000
+state_provider_type = "cached"
+
+[strategy]
+min_profit_threshold = "500000000000000"
+max_gas_price = "2000000000"
+
+[executor]
+mode = "dry_run"
+private_key_env_var = "PYRALIS_PRIVATE_KEY"
+
+[observability]
+enable_metrics = true
+enable_tui = true
+log_level = "info"

@@ -2771,6 +2771,11 @@ version = "0.1.0"
 [[package]]
 name = "pyralis-ingestion"
 version = "0.1.0"
+dependencies = [
+ "alloy",
+ "pyralis-core",
+ "tokio",
+]
 
 [[package]]
 name = "pyralis-observability"

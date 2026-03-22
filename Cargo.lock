@@ -2775,6 +2775,7 @@ dependencies = [
  "alloy",
  "pyralis-core",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -8,3 +8,4 @@ version.workspace = true
 alloy.workspace = true
 pyralis-core = { path = "../core" }
 tokio.workspace = true
+tracing.workspace = true

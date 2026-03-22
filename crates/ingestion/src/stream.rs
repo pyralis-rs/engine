@@ -5,11 +5,14 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::B256;
-use pyralis_core::error::Result;
+use pyralis_core::error::{PyralisError, Result};
 use pyralis_core::traits::ChainDataProvider;
 use pyralis_core::types::BlockInfo;
 use tokio::sync::{broadcast, mpsc, watch, RwLock};
 use tokio::task::JoinHandle;
+use tokio::time::sleep;
+
+use crate::reconnect::ReconnectionHandler;
 
 const UNIFIED_BLOCK_CHANNEL_SIZE: usize = 2048;
 const PROVIDER_EVENT_CHANNEL_SIZE: usize = 1024;
@@ -56,6 +59,7 @@ pub struct StreamManager<P> {
     providers: Vec<ProviderRegistration<P>>,
     block_sender: broadcast::Sender<BlockInfo>,
     provider_latencies: Arc<RwLock<HashMap<String, Duration>>>,
+    reconnection_handler: Arc<ReconnectionHandler>,
     shutdown_tx: watch::Sender<bool>,
     worker_handles: Vec<JoinHandle<()>>,
     merge_handle: Option<JoinHandle<()>>,
@@ -69,15 +73,25 @@ where
     pub fn new(providers: Vec<ProviderRegistration<P>>) -> Self {
         let (block_sender, _) = broadcast::channel(UNIFIED_BLOCK_CHANNEL_SIZE);
         let (shutdown_tx, _) = watch::channel(false);
+        let provider_names = providers
+            .iter()
+            .map(|registration| registration.name.clone());
+        let reconnection_handler = Arc::new(ReconnectionHandler::new_noop(provider_names));
 
         Self {
             providers,
             block_sender,
             provider_latencies: Arc::new(RwLock::new(HashMap::new())),
+            reconnection_handler,
             shutdown_tx,
             worker_handles: Vec::new(),
             merge_handle: None,
         }
+    }
+
+    /// Replaces the default reconnection handler.
+    pub fn set_reconnection_handler(&mut self, reconnection_handler: Arc<ReconnectionHandler>) {
+        self.reconnection_handler = reconnection_handler;
     }
 
     /// Starts provider workers and the merge loop.
@@ -117,11 +131,26 @@ where
             }
         }));
 
+        let mut active_workers = 0usize;
+
         for registration in &self.providers {
             let provider_name = registration.name.clone();
             let mut shutdown_rx = self.shutdown_tx.subscribe();
             let event_tx = event_tx.clone();
-            let mut receiver = registration.provider.subscribe_blocks().await?;
+            let reconnection_handler = Arc::clone(&self.reconnection_handler);
+
+            let mut receiver = match registration.provider.subscribe_blocks().await {
+                Ok(value) => {
+                    self.reconnection_handler.record_reconnect(&provider_name);
+                    value
+                }
+                Err(_) => {
+                    self.reconnection_handler.record_disconnect(&provider_name);
+                    let backoff = self.reconnection_handler.next_backoff(&provider_name);
+                    sleep(backoff).await;
+                    continue;
+                }
+            };
 
             let handle = tokio::spawn(async move {
                 loop {
@@ -134,15 +163,24 @@ where
                         incoming = receiver.recv() => {
                             match incoming {
                                 Ok(block) => {
-                                    if event_tx.send(ProviderBlockEvent {
-                                        provider_name: provider_name.clone(),
-                                        block,
-                                    }).await.is_err() {
+                                    if event_tx
+                                        .send(ProviderBlockEvent {
+                                            provider_name: provider_name.clone(),
+                                            block,
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
                                         break;
                                     }
                                 }
                                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                                Err(broadcast::error::RecvError::Closed) => break,
+                                Err(broadcast::error::RecvError::Closed) => {
+                                    reconnection_handler.record_disconnect(&provider_name);
+                                    let backoff = reconnection_handler.next_backoff(&provider_name);
+                                    sleep(backoff).await;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -150,6 +188,13 @@ where
             });
 
             self.worker_handles.push(handle);
+            active_workers = active_workers.saturating_add(1);
+        }
+
+        if active_workers == 0 {
+            return Err(PyralisError::Provider(
+                "no active provider subscriptions could be established".to_string(),
+            ));
         }
 
         Ok(())

@@ -9,3 +9,6 @@ alloy.workspace = true
 pyralis-core = { path = "../core" }
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+toml = "0.9"

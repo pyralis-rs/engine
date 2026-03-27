@@ -235,3 +235,112 @@ fn block_latency(block_timestamp: u64) -> Duration {
         .as_secs();
     Duration::from_secs(now.saturating_sub(block_timestamp))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use alloy::primitives::{Address, B256};
+    use alloy::rpc::types::eth::Transaction;
+    use pyralis_core::error::Result;
+    use pyralis_core::traits::ChainDataProvider;
+    use tokio::sync::broadcast;
+    use tokio::time::timeout;
+
+    use super::{BlockDeduplicator, ProviderRegistration, StreamManager};
+
+    #[derive(Debug)]
+    struct MockProvider {
+        block_sender: broadcast::Sender<pyralis_core::types::BlockInfo>,
+        pending_sender: broadcast::Sender<Transaction>,
+    }
+
+    impl MockProvider {
+        fn new() -> Self {
+            let (block_sender, _) = broadcast::channel(32);
+            let (pending_sender, _) = broadcast::channel(32);
+            Self {
+                block_sender,
+                pending_sender,
+            }
+        }
+
+        fn emit_block(&self, block: pyralis_core::types::BlockInfo) {
+            let _ = self.block_sender.send(block);
+        }
+    }
+
+    #[allow(async_fn_in_trait)]
+    impl ChainDataProvider for MockProvider {
+        async fn subscribe_blocks(
+            &self,
+        ) -> Result<broadcast::Receiver<pyralis_core::types::BlockInfo>> {
+            Ok(self.block_sender.subscribe())
+        }
+
+        async fn subscribe_pending_txs(&self) -> Result<broadcast::Receiver<Transaction>> {
+            Ok(self.pending_sender.subscribe())
+        }
+
+        async fn get_storage_at(
+            &self,
+            _address: Address,
+            _slot: B256,
+            _block_number: Option<u64>,
+        ) -> Result<B256> {
+            Ok(B256::ZERO)
+        }
+
+        async fn get_block_by_number(
+            &self,
+            _block_number: u64,
+        ) -> Result<Option<pyralis_core::types::BlockInfo>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn test_deduplicator_ignores_duplicate_hashes() {
+        let mut deduplicator = BlockDeduplicator::default();
+        let hash = B256::repeat_byte(9);
+
+        assert!(deduplicator.is_new_block(hash));
+        assert!(!deduplicator.is_new_block(hash));
+    }
+
+    #[tokio::test]
+    async fn test_stream_manager_deduplicates_same_hash_from_multiple_providers() {
+        let provider_a = Arc::new(MockProvider::new());
+        let provider_b = Arc::new(MockProvider::new());
+
+        let mut manager = StreamManager::new(vec![
+            ProviderRegistration::new("provider-a", Arc::clone(&provider_a)),
+            ProviderRegistration::new("provider-b", Arc::clone(&provider_b)),
+        ]);
+        assert!(manager.start().await.is_ok());
+
+        let mut unified = manager.subscribe_blocks();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .as_secs();
+        let block = pyralis_core::types::BlockInfo {
+            number: 777,
+            hash: B256::repeat_byte(3),
+            timestamp: now,
+            base_fee: Some(10),
+        };
+
+        provider_a.emit_block(block.clone());
+        provider_b.emit_block(block);
+
+        let first = timeout(Duration::from_millis(300), unified.recv()).await;
+        assert!(matches!(first, Ok(Ok(_))));
+
+        let second = timeout(Duration::from_millis(300), unified.recv()).await;
+        assert!(second.is_err());
+
+        manager.shutdown().await;
+    }
+}

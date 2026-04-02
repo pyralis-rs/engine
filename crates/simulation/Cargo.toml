@@ -6,7 +6,9 @@ version.workspace = true
 
 [dependencies]
 alloy.workspace = true
+dashmap.workspace = true
 pyralis-core = { path = "../core" }
 revm.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

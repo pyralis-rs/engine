@@ -19,6 +19,7 @@ version = "0.1.0"
 alloy = { version = "1", features = ["full"] }
 anyhow = "1"
 config = "0.15"
+dashmap = "6"
 revm = "31"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }

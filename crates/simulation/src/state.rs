@@ -90,13 +90,15 @@ where
         slot: U256,
     ) -> std::result::Result<U256, StateProviderError> {
         let slot_key = u256_to_b256(slot);
-        let fetched = self
-            .runtime
-            .block_on(
-                self.provider
-                    .get_storage_at(address, slot_key, self.block_number),
-            )
-            .map_err(|error| StateProviderError::Message(error.to_string()))?;
+        let fetch_future = self
+            .provider
+            .get_storage_at(address, slot_key, self.block_number);
+        let fetched = if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| self.runtime.block_on(fetch_future))
+        } else {
+            self.runtime.block_on(fetch_future)
+        }
+        .map_err(|error| StateProviderError::Message(error.to_string()))?;
         Ok(b256_to_u256(fetched))
     }
 }
@@ -301,4 +303,105 @@ fn u256_to_b256(value: U256) -> B256 {
 
 fn b256_to_u256(value: B256) -> U256 {
     U256::from_be_slice(value.as_slice())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use alloy::rpc::types::eth::Transaction;
+    use pyralis_core::traits::ChainDataProvider;
+    use tokio::sync::broadcast;
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct MockProvider {
+        storage_values: DashMap<(Address, B256, Option<u64>), B256>,
+        storage_calls: AtomicUsize,
+    }
+
+    impl MockProvider {
+        fn new() -> Self {
+            Self {
+                storage_values: DashMap::new(),
+                storage_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn insert_storage(
+            &self,
+            address: Address,
+            slot: B256,
+            block_number: Option<u64>,
+            value: B256,
+        ) {
+            self.storage_values
+                .insert((address, slot, block_number), value);
+        }
+
+        fn storage_calls(&self) -> usize {
+            self.storage_calls.load(Ordering::Relaxed)
+        }
+    }
+
+    #[allow(async_fn_in_trait)]
+    impl ChainDataProvider for MockProvider {
+        async fn subscribe_blocks(
+            &self,
+        ) -> Result<broadcast::Receiver<pyralis_core::types::BlockInfo>> {
+            let (_sender, receiver) = broadcast::channel(1);
+            Ok(receiver)
+        }
+
+        async fn subscribe_pending_txs(&self) -> Result<broadcast::Receiver<Transaction>> {
+            let (_sender, receiver) = broadcast::channel(1);
+            Ok(receiver)
+        }
+
+        async fn get_storage_at(
+            &self,
+            address: Address,
+            slot: B256,
+            block_number: Option<u64>,
+        ) -> Result<B256> {
+            self.storage_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self
+                .storage_values
+                .get(&(address, slot, block_number))
+                .map(|value| *value)
+                .unwrap_or(B256::ZERO))
+        }
+
+        async fn get_block_by_number(
+            &self,
+            _block_number: u64,
+        ) -> Result<Option<pyralis_core::types::BlockInfo>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn test_lazy_state_provider_caches_storage_slots() {
+        let provider = Arc::new(MockProvider::new());
+        let address = Address::repeat_byte(0xAA);
+        let slot = U256::from(9_u64);
+        let value = U256::from(42_u64);
+        provider.insert_storage(address, u256_to_b256(slot), Some(123), u256_to_b256(value));
+
+        let mut state = LazyStateProvider::new(Arc::clone(&provider), Some(123))
+            .expect("lazy state provider should initialize");
+
+        let first = state
+            .storage(address, slot)
+            .expect("first slot read should succeed");
+        let second = state
+            .storage(address, slot)
+            .expect("second slot read should hit cache");
+
+        assert_eq!(first, value);
+        assert_eq!(second, value);
+        assert_eq!(state.cached_slot_count(), 1);
+        assert_eq!(provider.storage_calls(), 1);
+    }
 }

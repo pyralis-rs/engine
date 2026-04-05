@@ -190,3 +190,76 @@ fn low_i32(value: U256) -> i32 {
     raw.copy_from_slice(&bytes[28..]);
     i32::from_be_bytes(raw)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use alloy::primitives::I256;
+
+    use crate::state::CachedStateProvider;
+
+    use super::*;
+
+    #[test]
+    fn test_read_pool_state_from_cached_storage() {
+        let pool_manager = Address::repeat_byte(0x99);
+        let pool_key = PoolKey {
+            token0: Address::repeat_byte(0x01),
+            token1: Address::repeat_byte(0x02),
+            fee: 3_000,
+            tick_spacing: 60,
+            hooks: Address::ZERO,
+        };
+        let pool_id = pool_id_from_key(&pool_key);
+        let mut slot_map = HashMap::new();
+        slot_map.insert(
+            pool_field_slot(pool_id, SQRT_PRICE_SLOT_OFFSET),
+            U256::from(123_456_u64),
+        );
+        slot_map.insert(
+            pool_field_slot(pool_id, LIQUIDITY_SLOT_OFFSET),
+            U256::from(999_u64),
+        );
+        slot_map.insert(
+            pool_field_slot(pool_id, TICK_SLOT_OFFSET),
+            U256::from_be_slice(&{
+                let mut bytes = [0_u8; 32];
+                bytes[28..].copy_from_slice(&(-120_i32).to_be_bytes());
+                bytes
+            }),
+        );
+
+        let mut db = CachedStateProvider::new();
+        db.cache_slots(pool_manager, slot_map);
+
+        let state = read_pool_state(&mut db, pool_manager, &pool_key)
+            .expect("pool state read should succeed");
+
+        assert_eq!(state.sqrt_price_x96, U256::from(123_456_u64));
+        assert_eq!(state.liquidity, 999);
+        assert_eq!(state.tick, -120);
+        assert_eq!(state.token0, pool_key.token0);
+        assert_eq!(state.token1, pool_key.token1);
+    }
+
+    #[test]
+    fn test_encode_v4_swap_call_rejects_out_of_range_fee() {
+        let pool_key = PoolKey {
+            token0: Address::repeat_byte(0x11),
+            token1: Address::repeat_byte(0x22),
+            fee: MAX_U24 + 1,
+            tick_spacing: 10,
+            hooks: Address::ZERO,
+        };
+        let swap_params = SwapParams {
+            zero_for_one: true,
+            amount_specified: I256::from_raw(U256::from(1_u64)),
+            sqrt_price_limit_x96: U256::from(1_u64),
+            hook_data: Bytes::new(),
+        };
+
+        let encoded = encode_v4_swap_call(&pool_key, &swap_params, Bytes::new());
+        assert!(encoded.is_err());
+    }
+}

@@ -26,3 +26,24 @@ fn estimate_l1_data_gas_units(tx_data: &[u8]) -> u128 {
         .map(|byte| if *byte == 0 { 4_u128 } else { 16_u128 })
         .sum()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::estimate_total_gas_cost;
+
+    #[test]
+    fn test_estimate_total_gas_cost_matches_op_stack_formula() {
+        let tx_data = [0_u8, 1_u8, 2_u8];
+        let total = estimate_total_gas_cost(&tx_data, 1_000, 10, 2);
+
+        // l2: 1_000 * 10 = 10_000
+        // l1 units: 4 + 16 + 16 = 36, fee: 36 * 2 = 72
+        assert_eq!(total, 10_072);
+    }
+
+    #[test]
+    fn test_estimate_total_gas_cost_saturates_on_overflow() {
+        let total = estimate_total_gas_cost(&[1_u8], u64::MAX, u128::MAX, u128::MAX);
+        assert_eq!(total, u128::MAX);
+    }
+}

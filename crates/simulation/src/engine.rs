@@ -113,8 +113,8 @@ where
         Ok(results)
     }
 
-    fn update_block_env(&self, block: &BlockInfo) {
-        let mut env = self.block_env.blocking_write();
+    async fn update_block_env(&self, block: &BlockInfo) {
+        let mut env = self.block_env.write().await;
         env.number = U256::from(block.number);
         env.timestamp = U256::from(block.timestamp);
         env.basefee = block
@@ -143,7 +143,7 @@ where
             .cache
             .block_hashes
             .insert(U256::from(block.number), block.hash);
-        self.update_block_env(&block);
+        self.update_block_env(&block).await;
         Ok(())
     }
 
@@ -191,4 +191,102 @@ fn tx_request_to_tx_env(tx: &TransactionRequest) -> Result<TxEnv> {
         .map_err(|error| {
             PyralisError::Simulation(format!("failed to build revm transaction env: {error:?}"))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::{Address, B256, U256};
+    use alloy::rpc::types::eth::Transaction;
+    use dashmap::DashMap;
+    use tokio::sync::broadcast;
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct MockProvider {
+        blocks: DashMap<u64, BlockInfo>,
+    }
+
+    impl MockProvider {
+        fn new(block: BlockInfo) -> Self {
+            let blocks = DashMap::new();
+            blocks.insert(block.number, block);
+            Self { blocks }
+        }
+    }
+
+    #[allow(async_fn_in_trait)]
+    impl ChainDataProvider for MockProvider {
+        async fn subscribe_blocks(&self) -> Result<broadcast::Receiver<BlockInfo>> {
+            let (_sender, receiver) = broadcast::channel(1);
+            Ok(receiver)
+        }
+
+        async fn subscribe_pending_txs(&self) -> Result<broadcast::Receiver<Transaction>> {
+            let (_sender, receiver) = broadcast::channel(1);
+            Ok(receiver)
+        }
+
+        async fn get_storage_at(
+            &self,
+            _address: Address,
+            _slot: B256,
+            _block_number: Option<u64>,
+        ) -> Result<B256> {
+            Ok(B256::ZERO)
+        }
+
+        async fn get_block_by_number(&self, block_number: u64) -> Result<Option<BlockInfo>> {
+            Ok(self.blocks.get(&block_number).map(|block| block.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_simulation_engine_simulate_tx_with_hardcoded_state() {
+        let block = BlockInfo {
+            number: 1,
+            hash: B256::repeat_byte(0x11),
+            timestamp: 1_700_000_000,
+            base_fee: Some(1),
+        };
+        let provider = Arc::new(MockProvider::new(block));
+        let engine = SimulationEngine::new(provider);
+        engine
+            .load_state(1)
+            .await
+            .expect("state load should succeed");
+
+        let sender = Address::repeat_byte(0xAA);
+        let receiver = Address::repeat_byte(0xBB);
+        engine
+            .insert_account_info(
+                sender,
+                AccountInfo::default().with_balance(U256::from(10_000_000_u64)),
+            )
+            .await;
+        engine
+            .insert_account_info(receiver, AccountInfo::default())
+            .await;
+
+        let tx = TransactionRequest {
+            from: Some(sender),
+            to: Some(TxKind::Call(receiver)),
+            gas: Some(21_000),
+            gas_price: Some(1),
+            value: Some(U256::from(1_000_u64)),
+            ..Default::default()
+        };
+
+        let result = engine
+            .simulate_tx_detailed(&tx)
+            .await
+            .expect("simulation should succeed");
+
+        assert!(result.success);
+        assert!(result.gas_used > 0);
+        assert_eq!(
+            engine.last_duration_micros(),
+            u64::try_from(result.duration_micros).unwrap_or(u64::MAX)
+        );
+    }
 }

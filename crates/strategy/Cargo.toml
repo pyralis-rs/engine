@@ -5,3 +5,7 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+alloy.workspace = true
+pyralis-core = { path = "../core" }
+tokio.workspace = true
+tracing.workspace = true

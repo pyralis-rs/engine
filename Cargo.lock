@@ -3449,6 +3449,12 @@ dependencies = [
 [[package]]
 name = "pyralis-strategy"
 version = "0.1.0"
+dependencies = [
+ "alloy",
+ "pyralis-core",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "quick-error"

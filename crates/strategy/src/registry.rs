@@ -88,3 +88,133 @@ impl StrategyRegistry {
         opportunities
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use alloy::primitives::{Address, B256, U256};
+    use pyralis_core::error::{PyralisError, Result};
+    use pyralis_core::traits::Strategy;
+    use pyralis_core::types::{BlockInfo, Opportunity, SimulationContext};
+
+    use super::StrategyRegistry;
+
+    struct MockStrategy {
+        name: &'static str,
+        profits: Vec<U256>,
+        should_fail: bool,
+        sleep_millis: u64,
+    }
+
+    impl Strategy for MockStrategy {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn evaluate(&self, context: &SimulationContext) -> Result<Vec<Opportunity>> {
+            if self.sleep_millis > 0 {
+                std::thread::sleep(Duration::from_millis(self.sleep_millis));
+            }
+
+            if self.should_fail {
+                return Err(PyralisError::Strategy("mock failure".to_string()));
+            }
+
+            Ok(self
+                .profits
+                .iter()
+                .copied()
+                .map(|profit| Opportunity {
+                    strategy_name: self.name.to_string(),
+                    estimated_profit: profit,
+                    confidence: 0.9,
+                    pools_involved: vec![Address::repeat_byte(0x11)],
+                    timestamp: context.block.timestamp,
+                })
+                .collect())
+        }
+    }
+
+    fn simulation_context() -> SimulationContext {
+        SimulationContext {
+            block: BlockInfo {
+                number: 1,
+                hash: B256::repeat_byte(0x01),
+                timestamp: 1_700_000_000,
+                base_fee: Some(1),
+            },
+            pool_states: Vec::new(),
+            pending_txs: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_registry_list_strategies() {
+        let mut registry = StrategyRegistry::new();
+        registry.register(MockStrategy {
+            name: "s1",
+            profits: vec![],
+            should_fail: false,
+            sleep_millis: 0,
+        });
+        registry.register(MockStrategy {
+            name: "s2",
+            profits: vec![],
+            should_fail: false,
+            sleep_millis: 0,
+        });
+
+        let names = registry.list_strategies();
+        assert_eq!(names, vec!["s1", "s2"]);
+    }
+
+    #[tokio::test]
+    async fn test_registry_evaluate_all_merges_and_sorts_desc() {
+        let mut registry = StrategyRegistry::new();
+        registry.register(MockStrategy {
+            name: "slow",
+            profits: vec![U256::from(2_u64)],
+            should_fail: false,
+            sleep_millis: 30,
+        });
+        registry.register(MockStrategy {
+            name: "fast",
+            profits: vec![U256::from(10_u64), U256::from(5_u64)],
+            should_fail: false,
+            sleep_millis: 0,
+        });
+
+        let context = simulation_context();
+        let opportunities = registry.evaluate_all(&context).await;
+
+        assert_eq!(opportunities.len(), 3);
+        assert_eq!(opportunities[0].estimated_profit, U256::from(10_u64));
+        assert_eq!(opportunities[1].estimated_profit, U256::from(5_u64));
+        assert_eq!(opportunities[2].estimated_profit, U256::from(2_u64));
+    }
+
+    #[tokio::test]
+    async fn test_registry_evaluate_all_skips_failed_strategy() {
+        let mut registry = StrategyRegistry::new();
+        registry.register(MockStrategy {
+            name: "ok",
+            profits: vec![U256::from(7_u64)],
+            should_fail: false,
+            sleep_millis: 0,
+        });
+        registry.register(MockStrategy {
+            name: "fail",
+            profits: vec![U256::from(99_u64)],
+            should_fail: true,
+            sleep_millis: 0,
+        });
+
+        let context = simulation_context();
+        let opportunities = registry.evaluate_all(&context).await;
+
+        assert_eq!(opportunities.len(), 1);
+        assert_eq!(opportunities[0].strategy_name, "ok");
+        assert_eq!(opportunities[0].estimated_profit, U256::from(7_u64));
+    }
+}

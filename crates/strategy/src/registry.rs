@@ -1,5 +1,6 @@
 //! Registry for coordinating multiple strategy implementations.
 
+use std::cmp::Reverse;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -84,7 +85,7 @@ impl StrategyRegistry {
             }
         }
 
-        opportunities.sort_by(|left, right| right.estimated_profit.cmp(&left.estimated_profit));
+        opportunities.sort_by_key(|opportunity| Reverse(opportunity.estimated_profit));
         opportunities
     }
 }

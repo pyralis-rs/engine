@@ -96,6 +96,12 @@ where
 
     /// Starts provider workers and the merge loop.
     pub async fn start(&mut self) -> Result<()> {
+        if self.providers.is_empty() {
+            return Err(PyralisError::Provider(
+                "no providers configured for stream manager".to_string(),
+            ));
+        }
+
         let (event_tx, mut event_rx) =
             mpsc::channel::<ProviderBlockEvent>(PROVIDER_EVENT_CHANNEL_SIZE);
         let unified_sender = self.block_sender.clone();
@@ -131,55 +137,90 @@ where
             }
         }));
 
-        let mut active_workers = 0usize;
-
         for registration in &self.providers {
             let provider_name = registration.name.clone();
+            let provider = Arc::clone(&registration.provider);
             let mut shutdown_rx = self.shutdown_tx.subscribe();
             let event_tx = event_tx.clone();
             let reconnection_handler = Arc::clone(&self.reconnection_handler);
-
-            let mut receiver = match registration.provider.subscribe_blocks().await {
+            let initial_receiver = match registration.provider.subscribe_blocks().await {
                 Ok(value) => {
                     self.reconnection_handler.record_reconnect(&provider_name);
-                    value
+                    Some(value)
                 }
                 Err(_) => {
                     self.reconnection_handler.record_disconnect(&provider_name);
-                    let backoff = self.reconnection_handler.next_backoff(&provider_name);
-                    sleep(backoff).await;
-                    continue;
+                    None
                 }
             };
 
             let handle = tokio::spawn(async move {
+                let mut current_receiver = initial_receiver;
+
                 loop {
-                    tokio::select! {
-                        changed = shutdown_rx.changed() => {
-                            if changed.is_ok() && *shutdown_rx.borrow() {
-                                break;
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+
+                    let mut receiver = if let Some(value) = current_receiver.take() {
+                        value
+                    } else {
+                        match subscribe_blocks_blocking(Arc::clone(&provider)) {
+                            Ok(value) => {
+                                reconnection_handler.record_reconnect(&provider_name);
+                                value
+                            }
+                            Err(_) => {
+                                reconnection_handler.record_disconnect(&provider_name);
+                                let backoff = reconnection_handler.next_backoff(&provider_name);
+                                tokio::select! {
+                                    changed = shutdown_rx.changed() => {
+                                        if changed.is_ok() && *shutdown_rx.borrow() {
+                                            break;
+                                        }
+                                    }
+                                    _ = sleep(backoff) => {}
+                                }
+                                continue;
                             }
                         }
-                        incoming = receiver.recv() => {
-                            match incoming {
-                                Ok(block) => {
-                                    if event_tx
-                                        .send(ProviderBlockEvent {
-                                            provider_name: provider_name.clone(),
-                                            block,
-                                        })
-                                        .await
-                                        .is_err()
-                                    {
+                    };
+
+                    loop {
+                        tokio::select! {
+                            changed = shutdown_rx.changed() => {
+                                if changed.is_ok() && *shutdown_rx.borrow() {
+                                    return;
+                                }
+                            }
+                            incoming = receiver.recv() => {
+                                match incoming {
+                                    Ok(block) => {
+                                        if event_tx
+                                            .send(ProviderBlockEvent {
+                                                provider_name: provider_name.clone(),
+                                                block,
+                                            })
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                    Err(broadcast::error::RecvError::Closed) => {
+                                        reconnection_handler.record_disconnect(&provider_name);
+                                        let backoff = reconnection_handler.next_backoff(&provider_name);
+                                        tokio::select! {
+                                            changed = shutdown_rx.changed() => {
+                                                if changed.is_ok() && *shutdown_rx.borrow() {
+                                                    return;
+                                                }
+                                            }
+                                            _ = sleep(backoff) => {}
+                                        }
                                         break;
                                     }
-                                }
-                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                                Err(broadcast::error::RecvError::Closed) => {
-                                    reconnection_handler.record_disconnect(&provider_name);
-                                    let backoff = reconnection_handler.next_backoff(&provider_name);
-                                    sleep(backoff).await;
-                                    break;
                                 }
                             }
                         }
@@ -188,13 +229,6 @@ where
             });
 
             self.worker_handles.push(handle);
-            active_workers = active_workers.saturating_add(1);
-        }
-
-        if active_workers == 0 {
-            return Err(PyralisError::Provider(
-                "no active provider subscriptions could be established".to_string(),
-            ));
         }
 
         Ok(())
@@ -236,9 +270,25 @@ fn block_latency(block_timestamp: u64) -> Duration {
     Duration::from_secs(now.saturating_sub(block_timestamp))
 }
 
+fn subscribe_blocks_blocking<P>(provider: Arc<P>) -> Result<broadcast::Receiver<BlockInfo>>
+where
+    P: ChainDataProvider + Send + Sync + 'static,
+{
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(provider.subscribe_blocks())
+    })
+    .join()
+    .map_err(|_| PyralisError::Internal("provider subscription thread panicked".to_string()))?
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use alloy::primitives::{Address, B256};
@@ -246,6 +296,7 @@ mod tests {
     use pyralis_core::error::Result;
     use pyralis_core::traits::ChainDataProvider;
     use tokio::sync::broadcast;
+    use tokio::time::sleep;
     use tokio::time::timeout;
 
     use super::{BlockDeduplicator, ProviderRegistration, StreamManager};
@@ -277,6 +328,77 @@ mod tests {
             &self,
         ) -> Result<broadcast::Receiver<pyralis_core::types::BlockInfo>> {
             Ok(self.block_sender.subscribe())
+        }
+
+        async fn subscribe_pending_txs(&self) -> Result<broadcast::Receiver<Transaction>> {
+            Ok(self.pending_sender.subscribe())
+        }
+
+        async fn get_storage_at(
+            &self,
+            _address: Address,
+            _slot: B256,
+            _block_number: Option<u64>,
+        ) -> Result<B256> {
+            Ok(B256::ZERO)
+        }
+
+        async fn get_block_by_number(
+            &self,
+            _block_number: u64,
+        ) -> Result<Option<pyralis_core::types::BlockInfo>> {
+            Ok(None)
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReconnectingMockProvider {
+        block_senders: Mutex<Vec<broadcast::Sender<pyralis_core::types::BlockInfo>>>,
+        pending_sender: broadcast::Sender<Transaction>,
+        subscribe_calls: AtomicUsize,
+    }
+
+    impl ReconnectingMockProvider {
+        fn new() -> Self {
+            let (pending_sender, _) = broadcast::channel(32);
+            Self {
+                block_senders: Mutex::new(Vec::new()),
+                pending_sender,
+                subscribe_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn subscribe_calls(&self) -> usize {
+            self.subscribe_calls.load(Ordering::Relaxed)
+        }
+
+        fn emit_latest(&self, block: pyralis_core::types::BlockInfo) -> bool {
+            self.block_senders
+                .lock()
+                .ok()
+                .and_then(|senders| senders.last().cloned())
+                .map(|sender| sender.send(block).is_ok())
+                .unwrap_or(false)
+        }
+
+        fn close_latest(&self) {
+            if let Ok(mut senders) = self.block_senders.lock() {
+                senders.pop();
+            }
+        }
+    }
+
+    #[allow(async_fn_in_trait)]
+    impl ChainDataProvider for ReconnectingMockProvider {
+        async fn subscribe_blocks(
+            &self,
+        ) -> Result<broadcast::Receiver<pyralis_core::types::BlockInfo>> {
+            self.subscribe_calls.fetch_add(1, Ordering::Relaxed);
+            let (sender, receiver) = broadcast::channel(32);
+            if let Ok(mut senders) = self.block_senders.lock() {
+                senders.push(sender);
+            }
+            Ok(receiver)
         }
 
         async fn subscribe_pending_txs(&self) -> Result<broadcast::Receiver<Transaction>> {
@@ -340,6 +462,58 @@ mod tests {
 
         let second = timeout(Duration::from_millis(300), unified.recv()).await;
         assert!(second.is_err());
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_stream_manager_resubscribes_after_disconnect() {
+        let provider = Arc::new(ReconnectingMockProvider::new());
+        let mut manager = StreamManager::new(vec![ProviderRegistration::new(
+            "provider-reconnect",
+            Arc::clone(&provider),
+        )]);
+        assert!(manager.start().await.is_ok());
+
+        let mut unified = manager.subscribe_blocks();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .as_secs();
+
+        assert!(provider.emit_latest(pyralis_core::types::BlockInfo {
+            number: 1,
+            hash: B256::repeat_byte(0x01),
+            timestamp: now,
+            base_fee: Some(1),
+        }));
+        assert!(matches!(
+            timeout(Duration::from_millis(300), unified.recv()).await,
+            Ok(Ok(_))
+        ));
+
+        provider.close_latest();
+        let wait_reconnect = timeout(Duration::from_secs(2), async {
+            loop {
+                if provider.subscribe_calls() >= 2 {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(wait_reconnect.is_ok());
+
+        assert!(provider.emit_latest(pyralis_core::types::BlockInfo {
+            number: 2,
+            hash: B256::repeat_byte(0x02),
+            timestamp: now,
+            base_fee: Some(1),
+        }));
+        assert!(matches!(
+            timeout(Duration::from_millis(300), unified.recv()).await,
+            Ok(Ok(_))
+        ));
 
         manager.shutdown().await;
     }

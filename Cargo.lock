@@ -3395,9 +3395,13 @@ dependencies = [
 name = "pyralis-bin"
 version = "0.1.0"
 dependencies = [
+ "alloy",
  "anyhow",
  "config",
+ "pyralis-core",
  "pyralis-ingestion",
+ "pyralis-simulation",
+ "pyralis-strategy",
  "serde",
  "tokio",
  "tracing",

@@ -5,9 +5,13 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+alloy.workspace = true
 anyhow.workspace = true
 config.workspace = true
+pyralis-core = { path = "../core" }
 pyralis-ingestion = { path = "../ingestion" }
+pyralis-simulation = { path = "../simulation" }
+pyralis-strategy = { path = "../strategy" }
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true

@@ -1,5 +1,6 @@
 //! Uniswap V4 PoolManager storage and calldata helpers.
 
+use alloy::primitives::aliases::{I24, U24};
 use alloy::primitives::{keccak256, Address, Bytes, B256, I256, U256};
 use alloy::sol;
 use alloy::sol_types::SolCall;
@@ -20,8 +21,8 @@ sol! {
     struct PoolKeyAbi {
         address token0;
         address token1;
-        uint32 fee;
-        int32 tickSpacing;
+        uint24 fee;
+        int24 tickSpacing;
         address hooks;
     }
 
@@ -65,11 +66,11 @@ pub struct SwapParams {
 
 /// Computes a deterministic pool id from a V4 [`PoolKey`].
 pub fn pool_id_from_key(pool_key: &PoolKey) -> B256 {
-    let mut encoded = Vec::with_capacity(68);
+    let mut encoded = Vec::with_capacity(66);
     encoded.extend_from_slice(pool_key.token0.as_slice());
     encoded.extend_from_slice(pool_key.token1.as_slice());
-    encoded.extend_from_slice(&pool_key.fee.to_be_bytes());
-    encoded.extend_from_slice(&pool_key.tick_spacing.to_be_bytes());
+    encoded.extend_from_slice(&pool_key.fee.to_be_bytes()[1..]);
+    encoded.extend_from_slice(&pool_key.tick_spacing.to_be_bytes()[1..]);
     encoded.extend_from_slice(pool_key.hooks.as_slice());
     keccak256(encoded)
 }
@@ -137,8 +138,8 @@ pub fn encode_v4_swap_call(
         key: PoolKeyAbi {
             token0: pool_key.token0,
             token1: pool_key.token1,
-            fee: pool_key.fee,
-            tickSpacing: pool_key.tick_spacing,
+            fee: u24_from_u32(pool_key.fee)?,
+            tickSpacing: i24_from_i32(pool_key.tick_spacing)?,
             hooks: pool_key.hooks,
         },
         params: SwapParamsAbi {
@@ -189,6 +190,33 @@ fn low_i32(value: U256) -> i32 {
     let mut raw = [0_u8; 4];
     raw.copy_from_slice(&bytes[28..]);
     i32::from_be_bytes(raw)
+}
+
+fn u24_from_u32(value: u32) -> Result<U24> {
+    if value > MAX_U24 {
+        return Err(PyralisError::Abi(format!(
+            "fee value {} does not fit into uint24",
+            value
+        )));
+    }
+    Ok(U24::from(value))
+}
+
+fn i24_from_i32(value: i32) -> Result<I24> {
+    if !(MIN_I24..=MAX_I24).contains(&value) {
+        return Err(PyralisError::Abi(format!(
+            "tick spacing value {} does not fit into int24",
+            value
+        )));
+    }
+
+    let raw = if value >= 0 {
+        U24::from(value as u32)
+    } else {
+        let twos_complement = (1_i64 << 24) + i64::from(value);
+        U24::from(twos_complement as u32)
+    };
+    Ok(I24::from_raw(raw))
 }
 
 #[cfg(test)]

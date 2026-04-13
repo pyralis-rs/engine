@@ -14,7 +14,7 @@ use pyralis_core::types::{BlockInfo, ExecutionResult};
 use revm::context::{BlockEnv, Context, TxEnv};
 use revm::database::{CacheDB, EmptyDB};
 use revm::state::{AccountInfo, EvmState};
-use revm::{ExecuteEvm, MainBuilder, MainContext};
+use revm::{ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext};
 use tokio::sync::RwLock;
 
 /// Full simulation output returned by [`SimulationEngine::simulate_tx_detailed`].
@@ -105,10 +105,36 @@ where
         &self,
         txs: &[Transaction],
     ) -> Result<Vec<SimulationResult>> {
+        let block_env = self.block_env.read().await.clone();
+        let base_db_snapshot = self.base_db.read().await.clone();
+        let mut evm = Context::mainnet().with_db(base_db_snapshot).build_mainnet();
+        evm.set_block(block_env);
+
         let mut results = Vec::with_capacity(txs.len());
         for tx in txs {
             let request = TransactionRequest::from_transaction(tx.clone());
-            results.push(self.simulate_tx_detailed(&request).await?);
+            let tx_env = tx_request_to_tx_env(&request)?;
+
+            let started_at = Instant::now();
+            let execution = evm.transact_one(tx_env).map_err(|error| {
+                PyralisError::Simulation(format!("revm execution failed in batch: {error}"))
+            })?;
+            let state_changes = evm.finalize();
+            evm.commit(state_changes.clone());
+
+            let duration_micros = started_at.elapsed().as_micros();
+            let duration_u64 = u64::try_from(duration_micros).unwrap_or(u64::MAX);
+            self.last_duration_micros
+                .store(duration_u64, Ordering::Relaxed);
+
+            results.push(SimulationResult {
+                success: execution.is_success(),
+                gas_used: execution.gas_used(),
+                output: execution.output().cloned(),
+                logs: execution.logs().to_vec(),
+                state_changes,
+                duration_micros,
+            });
         }
         Ok(results)
     }
